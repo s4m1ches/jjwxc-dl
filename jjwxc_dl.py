@@ -53,6 +53,7 @@ class Chapter:
     url: str
     vip: bool
     words: int = 0        # wordCount advertised on the index page
+    font: str = ""        # jjwxcfont_* applied to this chapter's body
     text: str = ""
     status: str = "pending"  # ok | paywalled | error | pending
 
@@ -149,13 +150,30 @@ def fetch_index(novelid: str) -> Novel:
 
 EXTRACT_JS = """() => {
     const box = document.querySelector('div.noveltext');
-    if (!box) return '';
+    if (!box) return { text: '', font: '' };
     const kids = Array.from(box.children).filter(e => e.tagName === 'DIV');
     const pool = kids.length ? kids : [box];
     const best = pool.reduce((a, b) =>
         (b.innerText || '').trim().length > (a.innerText || '').trim().length ? b : a);
-    return (best.innerText || '').trim();
+
+    // The chapter's substituted webfont. Its name changes per chapter, and
+    // without it the Private Use Area codepoints in the text are unreadable.
+    let font = '';
+    for (const sheet of Array.from(document.styleSheets)) {
+        let rules;
+        try { rules = sheet.cssRules; } catch (e) { continue; }
+        for (const r of Array.from(rules || [])) {
+            if (r.constructor && r.constructor.name === 'CSSFontFaceRule') {
+                const m = r.cssText.match(/jjwxcfont_[A-Za-z0-9_]+/);
+                if (m) { font = m[0]; break; }
+            }
+        }
+        if (font) break;
+    }
+    return { text: (best.innerText || '').trim(), font: font };
 }"""
+
+FONT_URL = "https://static.jjwxc.net/tmp/fonts/%s.woff2?h=my.jjwxc.net"
 
 
 async def read_chapter(page, ch: Chapter, timeout_ms: int) -> Chapter:
@@ -168,7 +186,9 @@ async def read_chapter(page, ch: Chapter, timeout_ms: int) -> Chapter:
 
     # The body lives in whichever child div of .noveltext holds the most text;
     # its siblings are nav, ads and anti-scraping filler.
-    text = await page.evaluate(EXTRACT_JS)
+    got = await page.evaluate(EXTRACT_JS)
+    text = got.get("text") or ""
+    ch.font = got.get("font") or ""
 
     if not text:
         ch.status = "error"
@@ -230,8 +250,11 @@ async def cmd_fetch(args) -> None:
 
     profile = args.profile.expanduser()
     profile.mkdir(parents=True, exist_ok=True)
+    fontdir = out / "fonts"
+    fontdir.mkdir(parents=True, exist_ok=True)
 
     counts = {"ok": 0, "paywalled": 0, "error": 0}
+    fonts_saved = 0
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
             user_data_dir=str(profile),
@@ -257,8 +280,29 @@ async def cmd_fetch(args) -> None:
                         else:
                             await asyncio.sleep(args.delay * attempt * 2)
 
+                # Save the chapter's substituted font. Without it the Private
+                # Use Area codepoints in the text can never be resolved, and
+                # the name changes per chapter - so it has to be grabbed now,
+                # not reconstructed later.
+                note = ""
+                if ch.status == "ok" and ch.font:
+                    fpath = fontdir / (ch.font + ".woff2")
+                    if not fpath.exists():
+                        try:
+                            resp = await ctx.request.get(FONT_URL % ch.font)
+                            if resp.status == 200:
+                                fpath.write_bytes(await resp.body())
+                                fonts_saved += 1
+                            else:
+                                note = "  [font HTTP %d]" % resp.status
+                        except Exception as e:
+                            note = "  [font failed: %s]" % e
+                elif ch.status == "ok" and not ch.font:
+                    note = "  [no font on page]"
+
                 counts[ch.status] = counts.get(ch.status, 0) + 1
-                print(ch.status + (", %d chars" % ch.chars if ch.status == "ok" else ""))
+                print(ch.status + (", %d chars" % ch.chars if ch.status == "ok" else "")
+                      + note)
                 (chdir / ("%04d.json" % ch.index)).write_text(
                     json.dumps(asdict(ch), ensure_ascii=False, indent=2),
                     encoding="utf-8")
@@ -270,6 +314,10 @@ async def cmd_fetch(args) -> None:
 
     print("\nok: %d  paywalled: %d  errors: %d"
           % (counts["ok"], counts["paywalled"], counts["error"]))
+    have = len(list(fontdir.glob("*.woff2")))
+    print("chapter fonts: %d saved this run, %d on disk" % (fonts_saved, have))
+    if have:
+        print("next: python jjwxc_dl.py fontmap %s" % args.novelid)
     if counts["paywalled"]:
         print("Paywalled = chapters this account has not bought, or you are "
               "not signed in (run the login subcommand).")
@@ -299,7 +347,86 @@ async def cmd_login(args) -> None:
 # epub
 # --------------------------------------------------------------------------- #
 
+def load_chapters(out: Path) -> list:
+    return [json.loads(f.read_text(encoding="utf-8"))
+            for f in sorted((out / "chapters").glob("*.json"))]
+
+
+def cmd_fontmap(args) -> None:
+    """Identify the substituted glyphs once, for the whole book."""
+    import fontmap as fm
+
+    out = workdir(args.novelid, args.out)
+    fontdir = out / "fonts"
+    fonts = sorted(fontdir.glob("*.woff2"))
+    if not fonts:
+        sys.exit("no chapter fonts in %s - run fetch first (with a signed-in "
+                 "profile, so VIP pages load)" % fontdir)
+
+    chapters = load_chapters(out)
+    print("chapter fonts: %d, chapters on disk: %d" % (len(fonts), len(chapters)))
+
+    code_maps = {p.stem: fm.font_code_map(p) for p in fonts}
+    shared = [set(m.values()) for m in code_maps.values()]
+    if shared and all(s == shared[0] for s in shared):
+        print("all fonts define the same %d outlines" % len(shared[0]))
+    else:
+        sizes = sorted({len(s) for s in shared})
+        print("outline sets differ across fonts (sizes %s) - mapping each anyway"
+              % sizes)
+
+    texts = [c.get("text") or "" for c in chapters]
+    bi, tri = fm.build_corpus(texts)
+    print("corpus: %s bigrams, %s trigrams"
+          % (format(len(bi), ","), format(len(tri), ",")))
+
+    pairs = []
+    for c in chapters:
+        name = c.get("font")
+        if name and name in code_maps and c.get("text"):
+            pairs.append((c["text"], code_maps[name]))
+    contexts = fm.collect_contexts(pairs)
+    print("shapes with in-text context: %d" % len(contexts))
+
+    refs = [args.ref] if args.ref else fm.available_refs()
+    print("reference fonts: %s" % ", ".join(Path(r).name for r in refs))
+    print("\nmatching shapes (this takes a few minutes) ...", flush=True)
+    cands = fm.shape_candidates([str(p) for p in fonts], refs=refs)
+
+    print("\nresolving ...", flush=True)
+    table = fm.resolve(cands, contexts, bi, tri)
+
+    target = args.table or (out / "fontmap.json")
+    fm.save_table(target, table, meta={"novelid": args.novelid,
+                                       "fonts": len(fonts),
+                                       "refs": [Path(r).name for r in refs]})
+    print("\nwrote %s" % target)
+
+    unver = [h for h, v in table.items() if v["confidence"] == "unverified"]
+    if unver:
+        print("\n%d shapes are shape-match guesses with no corpus support."
+              % len(unver))
+        print("They are unreliable: the matcher favours rare characters over "
+              "the common ones they resemble.")
+        missing = [c["index"] for c in chapters
+                   if c.get("status") == "ok" and not c.get("font")]
+        if missing:
+            print("%d downloaded chapters have no font recorded - re-run fetch "
+                  "so every chapter contributes context." % len(missing))
+
+    low = {h: v for h, v in table.items() if v["confidence"] == "low"}
+    if low:
+        print("\n%d shapes stayed ambiguous even with context:" % len(low))
+        for h, v in sorted(low.items(), key=lambda kv: kv[1]["shape_gap"])[:40]:
+            print("  %s  %s   alts: %-12s gap %.4f  ngram %.2f  seen %d"
+                  % (h, v["char"], "/".join(v["alternatives"][:3]),
+                     v["shape_gap"], v.get("ngram_margin", 0), v["occurrences"]))
+    if low or unver:
+        print("\nEdit the 'char' field in %s to correct any of them." % target)
+
+
 def cmd_build(args) -> None:
+    import fontmap as fm
     from ebooklib import epub
 
     out = workdir(args.novelid, args.out)
@@ -308,12 +435,49 @@ def cmd_build(args) -> None:
         sys.exit("no download found in %s - run fetch first" % out)
     meta = json.loads(meta_f.read_text(encoding="utf-8"))
 
-    saved = [json.loads(f.read_text(encoding="utf-8"))
-             for f in sorted((out / "chapters").glob("*.json"))]
+    saved = load_chapters(out)
     good = [c for c in saved if c.get("status") == "ok" and c.get("text")]
     missing = [c for c in saved if c.get("status") != "ok"]
     if not good:
         sys.exit("no chapter text available to build from")
+
+    # Resolve the substituted font before writing anything. Shipping a book
+    # with silent holes in it is worse than refusing to build.
+    table_path = args.table or (out / "fontmap.json")
+    table = fm.load_table(table_path)
+    fontdir = out / "fonts"
+    code_maps = {p.stem: fm.font_code_map(p) for p in fontdir.glob("*.woff2")}
+    totals = {"pua_seen": 0, "filled": 0, "unmapped": 0, "low_conf": 0,
+              "markers_removed": 0}
+    undecoded = []
+    for c in good:
+        cm = code_maps.get(c.get("font") or "", {})
+        c["text"], st = fm.decode(c["text"], cm, table)
+        for k in totals:
+            totals[k] += st[k]
+        if st["unmapped"]:
+            undecoded.append((c["index"], st["unmapped"]))
+
+    if totals["pua_seen"]:
+        print("substituted characters: %s seen, %s restored, %s unresolved"
+              % (format(totals["pua_seen"], ","), format(totals["filled"], ","),
+                 format(totals["unmapped"], ",")))
+        print("zero-width markers removed: %s" % format(totals["markers_removed"], ","))
+        solid = totals["filled"] - totals["low_conf"] - totals["unverified"]
+        print("  corpus-verified: %s   ambiguous: %s   unverified guesses: %s"
+              % (format(solid, ","), format(totals["low_conf"], ","),
+                 format(totals["unverified"], ",")))
+        if totals["unverified"]:
+            print("  unverified substitutions are silent errors waiting to "
+                  "happen - run fontmap again once every chapter has a font")
+        if undecoded:
+            print("WARNING: %d chapters still contain unresolved holes; "
+                  "worst: %s" % (len(undecoded),
+                                 ", ".join("ch %d (%d)" % t for t in
+                                           sorted(undecoded, key=lambda t: -t[1])[:5])))
+            if not table:
+                print("No font map loaded. Run: python jjwxc_dl.py fontmap %s"
+                      % args.novelid)
 
     book = epub.EpubBook()
     book.set_identifier(str(uuid.uuid4()))
@@ -381,15 +545,27 @@ def main() -> None:
     f.add_argument("--headless", action="store_true",
                    help="hide the browser (omit while testing)")
 
+    m = sub.add_parser("fontmap",
+                       help="identify the substituted glyphs (run once per book)")
+    m.add_argument("novelid")
+    m.add_argument("--ref", default=None,
+                   help="reference CJK font to match against (default: auto)")
+    m.add_argument("--table", type=Path, default=None,
+                   help="where to write the map (default: <out>/fontmap.json)")
+
     b = sub.add_parser("build", help="assemble the EPUB from saved chapters")
     b.add_argument("novelid")
     b.add_argument("--epub", type=Path, default=None)
+    b.add_argument("--table", type=Path, default=None,
+                   help="font map to apply (default: <out>/fontmap.json)")
 
     args = p.parse_args()
     if args.cmd == "fetch":
         asyncio.run(cmd_fetch(args))
     elif args.cmd == "login":
         asyncio.run(cmd_login(args))
+    elif args.cmd == "fontmap":
+        cmd_fontmap(args)
     else:
         cmd_build(args)
 
