@@ -1,0 +1,4 @@
+httpx
+lxml
+playwright
+ebooklib

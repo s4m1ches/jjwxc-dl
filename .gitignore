@@ -1,0 +1,25 @@
+# Browser profile holding your signed-in JJWXC session. Publishing this hands
+# over access to your account. Never commit it.
+.jjwxc-profile/
+*.profile/
+
+# Downloaded books. VIP chapter text carries watermarks tied to the account
+# that bought it, so these files identify you. Keep them local.
+downloads/
+*.epub
+*.mobi
+*.azw3
+cover.jpg
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
