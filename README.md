@@ -1,5 +1,7 @@
 # jjwxc_dl
 
+**English** · [Русский](README.ru.md) · [简体中文](README.zh-CN.md)
+
 A resumable downloader that saves JJWXC (晋江文学城) chapters you have access to
 into an EPUB, built on Playwright.
 
