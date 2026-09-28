@@ -21,6 +21,7 @@ import random
 import re
 import sys
 import uuid
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -144,6 +145,33 @@ def fetch_index(novelid: str) -> Novel:
     return Novel(novelid, title, author, cover_url, chapters)
 
 
+def download_cover(url: str):
+    """Fetch the cover art, working around the CDN's hotlink protection.
+
+    Covers are not served by JJWXC itself but by Sina's image CDN, which
+    answers 403 to a bare request - and, oddly, to one refered from jjwxc.net
+    as well. Try the plain request first and only fall back; return
+    (bytes, None) or (None, reason).
+    """
+    attempts = [
+        {"User-Agent": UA},
+        {"User-Agent": UA, "Referer": "https://www.jjwxc.net/"},
+        {"User-Agent": UA, "Referer": "https://weibo.com/"},
+    ]
+    last = "no attempt made"
+    for headers in attempts:
+        try:
+            r = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
+        except Exception as e:
+            last = "%s: %s" % (type(e).__name__, e)
+            continue
+        ctype = r.headers.get("content-type", "")
+        if r.status_code == 200 and ctype.startswith("image/"):
+            return r.content, None
+        last = "HTTP %d, content-type %s" % (r.status_code, ctype or "?")
+    return None, last
+
+
 # --------------------------------------------------------------------------- #
 # fetching
 # --------------------------------------------------------------------------- #
@@ -226,13 +254,12 @@ async def cmd_fetch(args) -> None:
         encoding="utf-8")
 
     if novel.cover_url and not (out / "cover.jpg").exists():
-        try:
-            img = httpx.get(novel.cover_url, headers={"User-Agent": UA}, timeout=30)
-            img.raise_for_status()
-            (out / "cover.jpg").write_bytes(img.content)
-            print("cover saved")
-        except Exception as e:
-            print("cover download failed (%s) - continuing without it" % e)
+        data, why = download_cover(novel.cover_url)
+        if data:
+            (out / "cover.jpg").write_bytes(data)
+            print("cover saved (%d bytes)" % len(data))
+        else:
+            print("cover download failed (%s) - continuing without it" % why)
 
     todo = []
     for ch in novel.chapters:
@@ -449,14 +476,14 @@ def cmd_build(args) -> None:
     table = fm.load_table(table_path)
     fontdir = out / "fonts"
     code_maps = {p.stem: fm.font_code_map(p) for p in fontdir.glob("*.woff2")}
-    totals = {"pua_seen": 0, "filled": 0, "unmapped": 0, "low_conf": 0,
-              "markers_removed": 0}
+    # Counter, not a hand-kept key list: the decoder owns which counters exist,
+    # and adding one there must not crash the reporting here.
+    totals = Counter()
     undecoded = []
     for c in good:
         cm = code_maps.get(c.get("font") or "", {})
         c["text"], st = fm.decode(c["text"], cm, table)
-        for k in totals:
-            totals[k] += st[k]
+        totals.update({k: v for k, v in st.items() if isinstance(v, int)})
         if st["unmapped"]:
             undecoded.append((c["index"], st["unmapped"]))
 
