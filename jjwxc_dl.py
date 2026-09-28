@@ -408,11 +408,13 @@ def cmd_fontmap(args) -> None:
               % len(unver))
         print("They are unreliable: the matcher favours rare characters over "
               "the common ones they resemble.")
+        # Free chapters legitimately have no font - only paid ones are
+        # substituted, so only those missing a font are worth re-fetching.
         missing = [c["index"] for c in chapters
-                   if c.get("status") == "ok" and not c.get("font")]
+                   if c.get("status") == "ok" and c.get("vip") and not c.get("font")]
         if missing:
-            print("%d downloaded chapters have no font recorded - re-run fetch "
-                  "so every chapter contributes context." % len(missing))
+            print("%d paid chapters have no font recorded - re-run fetch so "
+                  "every chapter contributes context." % len(missing))
 
     low = {h: v for h, v in table.items() if v["confidence"] == "low"}
     if low:
