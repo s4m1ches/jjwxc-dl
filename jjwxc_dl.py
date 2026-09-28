@@ -46,6 +46,20 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PAYWALL_MARKERS = ("请先购买", "购买本章", "订阅本章", "尚未购买",
                    "需要购买", "先登录", "请登录")
 
+# JJWXC glues an advert into the text of paid chapters, a few times per
+# chapter, at the end of a paragraph. It is not the author's text and must
+# not reach the book.
+WATERMARKS = ("@无限好文，尽在晋江文学城",)
+
+
+def strip_watermarks(text: str) -> tuple[str, int]:
+    """Remove the site's watermark; return the clean text and how many went."""
+    count = 0
+    for mark in WATERMARKS:
+        count += text.count(mark)
+        text = text.replace(mark, "")
+    return text, count
+
 
 @dataclass
 class Chapter:
@@ -486,6 +500,13 @@ def cmd_build(args) -> None:
         totals.update({k: v for k, v in st.items() if isinstance(v, int)})
         if st["unmapped"]:
             undecoded.append((c["index"], st["unmapped"]))
+
+    removed = 0
+    for c in good:
+        c["text"], n = strip_watermarks(c["text"])
+        removed += n
+    if removed:
+        print("watermarks removed: %s" % format(removed, ","))
 
     if totals["pua_seen"]:
         print("substituted characters: %s seen, %s restored, %s unresolved"

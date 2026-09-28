@@ -100,7 +100,9 @@ python jjwxc_dl.py build 1234567
 ```
 
 Writes `downloads/<novelid>/<title>.epub` and lists any chapters that are not in
-it, along with an account of every substitution it made.
+it, along with an account of every substitution it made. It also strips the
+site's watermark «@无限好文，尽在晋江文学城» from chapter text, so it never reaches
+the book.
 
 ### Options
 
