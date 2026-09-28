@@ -19,6 +19,9 @@ EPUB with a cover and a table of contents.
   handles your password.
 - Chapters you have not bought are recorded as `paywalled`, reported at the end,
   and left out of the EPUB. They are not filled in with placeholder text.
+- Paid chapters arrive with part of their text hidden behind a substituted
+  font. The tool restores it and accounts for every character it puts back —
+  see [The substituted font](#the-substituted-font).
 
 It is not a paywall bypass and it does not touch any protection mechanism. If
 you want a book, buy it — the `fetch` output prints what the VIP part of a given
@@ -75,14 +78,29 @@ The session is kept in `.jjwxc-profile/` next to the script and reused by later
 `fetch` runs. Do not run two copies of the tool against one profile — Chromium
 locks it to a single process.
 
-### 3. Build the EPUB
+### 3. Build the font map
+
+```bash
+python jjwxc_dl.py fontmap 1234567
+```
+
+Identifies the characters that paid chapters hide behind a substituted font —
+see [The substituted font](#the-substituted-font). Run it once per book, after
+`fetch` has collected the chapter fonts. It takes a few minutes and writes
+`downloads/<novelid>/fontmap.json`.
+
+Anything it is unsure about is printed, with alternatives. Correct a wrong call
+by editing that entry's `char` field and running `build` again — no re-download
+needed.
+
+### 4. Build the EPUB
 
 ```bash
 python jjwxc_dl.py build 1234567
 ```
 
 Writes `downloads/<novelid>/<title>.epub` and lists any chapters that are not in
-it.
+it, along with an account of every substitution it made.
 
 ### Options
 
@@ -98,18 +116,64 @@ it.
 **Please do not lower `--delay`.** 300-odd sequential requests at full speed is
 the quickest way to get rate-limited, and it is rude to a site you are paying.
 
+## The substituted font
+
+Paid chapters are not served as plain text. Each one ships its own webfont
+(`jjwxcfont_*`) and part of the body is rewritten to Private Use Area
+codepoints, with a zero-width character marking every position that was
+swapped. Your browser shows the right characters because the font's glyph for
+`U+Ennn` draws them; save the text and you get holes instead. In the book this
+was built against, that was 45,496 characters — **3.5% of the text**, spread
+through every paid chapter, roughly one hole every second or third sentence.
+Free chapters are untouched.
+
+Two properties make it recoverable:
+
+- The glyph **outline** is the stable identity. Names inside the font encode
+  the PUA codepoint rather than the character, and the outlines are regenerated
+  through `svg2ttf` so they match no base font byte for byte — but every
+  chapter font defines the *same 200 outlines* and only shuffles which
+  codepoint points at which. That book used 93 distinct fonts across 305
+  chapters, all drawing on those same 200 shapes.
+- So 200 shapes get identified **once**, and every chapter then decodes by
+  lookup.
+
+Identification uses two signals, because shape alone is not trustworthy.
+Rendering a glyph and comparing it against candidates in three reference fonts
+gets most of them, but it systematically prefers rare characters to the common
+ones they resemble: it chose 冇 over 有, 犬 over 大, 已 over 己, with margins in
+the thousandths. So each candidate is also substituted back into the positions
+the glyph actually occupies, and the resulting bigrams and trigrams are scored
+against the clean text of the same book. On that book the corpus overruled the
+shape match **25 times out of 199** — about 5,500 characters that would
+otherwise have been silently wrong.
+
+A decision backed only by shape is labelled `unverified` however wide its
+margin, and `build` reports how many substitutions came from such entries. A
+hole is better than a plausible wrong character, so unresolved positions are
+left in place and counted rather than guessed.
+
+This resolves rendering, not access. Chapters you have not bought are never
+retrieved in the first place — they come back `paywalled` either way — so this
+only makes text you already paid for machine-readable.
+
 ## Layout
 
 ```
 downloads/<novelid>/
 ├─ meta.json              title, author
 ├─ cover.jpg
+├─ fontmap.json           outline hash -> character, with confidence
 ├─ <title>.epub
+├─ fonts/
+│  └─ jjwxcfont_*.woff2   one per chapter font, kept for reproducibility
 └─ chapters/
-   └─ 0001.json           index, title, url, vip, words, text, status
+   └─ 0001.json           index, title, url, vip, words, font, text, status
 ```
 
-`status` is one of `ok`, `paywalled`, `error`.
+`status` is one of `ok`, `paywalled`, `error`. Chapter text is stored exactly as
+the page served it, PUA codepoints and all; decoding happens at `build` time, so
+a corrected `fontmap.json` can be applied without downloading anything again.
 
 ## Troubleshooting
 
@@ -126,6 +190,24 @@ the page; please open an issue with what you see.
 
 **`UnicodeEncodeError` printing titles** — should not happen, the tool forces
 UTF-8 on its own streams. If it does, report your OS and console.
+
+**`build` says substitutions are unresolved** — run `fontmap` first, or re-run
+it: a shape can only be identified once some chapter actually uses it.
+
+**`fontmap` reports many `unverified` shapes** — it had too little context.
+Check that `downloads/<novelid>/fonts/` holds a font for every paid chapter;
+if not, re-run `fetch`. Free chapters have no font, which is normal.
+
+**`fontmap` cannot find a reference font** — pass one with `--ref`, e.g.
+`--ref /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`. Any broad CJK
+font works; three are used when available.
+
+**A character came out wrong** — edit its entry's `char` field in
+`fontmap.json` and re-run `build`. Please open an issue too: the map is the
+same for every book, so a correction helps everyone.
+
+**No cover in the EPUB** — covers come from Sina's image CDN, which rejects
+some requests. `fetch` prints why it gave up; re-running it retries.
 
 ## Credits
 
